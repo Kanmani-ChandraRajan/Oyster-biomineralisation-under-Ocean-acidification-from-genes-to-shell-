@@ -1,0 +1,279 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Long;
+use FindBin qw($Bin);
+use File::Basename qw(dirname basename);
+use lib "$Bin";
+my (@input,$norm,$outdir,$output,$site,$seqplat,$pnorm,$ncount,$quality,$percent,$qbase,$format,$adapter);
+GetOptions(
+	"i:s{1,}" => \@input,
+	"norm:s"  => \$norm,
+	"od:s"    => \$outdir,
+	"op:s"    => \$output,
+	"s:s"     => \$site,
+	"seqplat:s" => \$seqplat,
+
+	"pnorm:s" => \$pnorm,
+	"n:s"     => \$ncount,
+	"q:s"     => \$quality,
+	"p:s"     => \$percent,
+	"b:s"     => \$qbase,
+	"format:s"  => \$format,
+	"adapter:s" => \$adapter,
+);
+
+unless(@input && $norm && $outdir && $output && $site && $seqplat){
+	&usage;
+	exit;
+}
+
+
+####soft###########
+
+#设置默认参数
+$pnorm ||=0.03;#上浮范围
+$ncount ||=0.08;#N含量
+$quality ||=30;#质量值
+$percent ||=80;#质量值百分比
+$qbase ||=33;#质量体系
+$format ||="fq";#输出格式
+$adapter ||=2;#接头类型（1右,2左右）
+
+print STDOUT "Command: perl $0 -i @input -norm $norm -od $outdir -op $output -s $site -seqplat $seqplat -pnorm $pnorm -n $ncount -q $quality -p $percent -b $qbase -format $format -adapter $adapter\n";
+
+my (@range,@adapter);
+if($site==1){ #LpnPI
+	@range=(12,18);
+}else{
+	&usage;
+	exit;
+}
+
+if($adapter==1){#仅右接头
+	@adapter=(
+		"",
+		"AGATCG",
+		);
+}elsif($adapter==2){#左右接头
+	@adapter=(
+		"ACTGAT",
+		"AGATCG",		
+		)
+}else{
+	&usage;
+	exit;
+}
+
+#获取数据标准化随机数值
+if($norm=~/M$/){
+	$norm=~s/M$//;
+	$norm=$norm*1e6;
+}elsif($norm=~/G$/){
+	$norm=~s/G$//;
+	$norm=$norm*1e9;
+}else{
+	&usage;
+	print STDERR "-norm parameter error\n";
+	exit;
+}
+my $norm_max=$norm*($pnorm+1);
+chomp($norm=`shuf -i $norm-$norm_max -n1`);
+
+#合并数据并标准化
+&CheckDir("$outdir");
+&CheckDir("$outdir/RawData");
+if($#input==0){
+	if($seqplat eq "SE50"){
+		&execute("seqkit head -n $norm $input[0] | gzip  > $outdir/RawData/$output.raw.fq.gz");
+	}else{
+		&execute("seqkit head -n $norm $input[0] | gzip  > $outdir/$output.Xten.fq.gz");
+	}
+}else{
+	if($seqplat eq "SE50"){
+		my $cat="cat ";
+		for(@input){
+			$cat .=" $_ ";
+		}
+		$cat .=" | seqkit head -n $norm | gzip  > $outdir/RawData/$output.raw.fq.gz ";
+		&execute("$cat");
+	}else{
+		my $cat="cat ";
+		for(@input){
+			$cat .=" $_ ";
+		}
+		$cat .=" | seqkit head -n $norm | gzip  > $outdir/$output.Xten.fq.gz ";
+		&execute("$cat");
+	}
+}
+
+###数据拆分
+my $input="";
+if($seqplat eq "Xten"){
+	$input="$outdir/$output.Xten.fq.gz";
+	if($input=~/\.gz$/){
+		open IN,"gzip -dc $input|"||die "cannot open $input\n";
+	}else{
+		open IN,"$input"||die "cannot open $input\n";
+	}
+	open OU,"|gzip >$outdir/RawData/$output.raw.fq.gz"||die "cannot open $outdir/RawData/$output.raw.fq.gz\n";
+	while(my $line=<IN>){
+		$line .=<IN> . <IN> . <IN>;
+		my @tmp=split /\n/,$line;
+		$tmp[1]=substr($tmp[1],0,70);
+		$tmp[3]=substr($tmp[3],0,70);
+		print OU join("\n",@tmp[0..3]),"\n";
+	}
+	close IN;
+	close OU;
+	&execute("rm -f $outdir/$output.Xten.fq.gz");
+}elsif($seqplat eq "SE50"){
+	;
+}else{
+	&usage;
+	exit;
+}
+$input="$outdir/RawData/$output.raw.fq.gz";
+
+&CheckDir("$outdir/RawDataQC");
+
+&CheckDir("$outdir/EnzymeData");
+if($input=~/\.gz$/){
+	open IN,"gzip -dc $input|"||die "cannot open $input\n";
+}else{
+	open IN,"$input"||die "cannot open $input\n";
+}
+
+if($format eq "fq"){
+	open OU,"|gzip > $outdir/EnzymeData/$output.fq.gz"||die "cannot open $outdir/EnzymeData/$output.fq.gz\n";
+}elsif($format eq "fa"){
+	open OU,"|gzip > $outdir/EnzymeData/$output.fa.gz"||die "cannot open $outdir/EnzymeData/$output.fa.gz\n";
+}else{
+	&usage;
+	exit;
+}
+my ($raw,$cnt_adapter,$cnt_range,$cntN,$cntQ,$cnt_enzyme,$start,$end);
+while(my $line=<IN>){
+	$raw++;
+	$line .=<IN> . <IN> . <IN>;
+	next unless(&CheckN($line));#检测N含量
+	$cntN++;
+	next unless(&CheckQ($line));#检测Q30_85
+	$cntQ++;
+
+	my @tmp=split /\n/,$line;
+	if($tmp[1]=~s/^$adapter[0](.+)$adapter[1]\S*$/$1/){#取接头间序列
+		$cnt_adapter++;
+		my $length=length($tmp[1]);
+		if($site==1){
+			if($tmp[1]=~/(\w+)(CCGG|GCGG|ACGG|CCGT|TCGG|CCGA|CCGC|GCGC)(\w+)/){
+				my $start=length($1);
+				my $end=length($3);
+				$cnt_range++;
+				if(($start>$range[0] && $start<$range[1]) ||( $end>$range[0] && $end<$range[1])){#>取特定长度序列
+				;
+				}else{
+					next;
+				}
+			}else{
+				next;
+			}
+			$cnt_enzyme++;
+			my $begin=length($adapter[0]);
+			$tmp[3]=substr($tmp[3],$begin,$length);#截取质量值
+			my $sub_line=join("\n",@tmp[0..3]);
+			if($format eq "fq"){
+				print OU "$sub_line\n";#fastq格式
+			}else{
+				$tmp[0]=~s/@/>/;
+				print OU "$tmp[0]\n$tmp[1]\n";#fasta格式
+			}
+		}
+	}
+}
+close IN;
+close OU;
+
+my $ratio=$cnt_enzyme/$raw;
+$ratio=sprintf ("%.2f%%",$ratio*100);
+open ST,">$outdir/EnzymeData/$output.reads.xls"||die "cannot open $outdir/EnzymeData/$output.reads.xls\n";
+print ST "Sample\tRaw_Reads\tCut_N\tQ30_$percent\tAdapter_Reads\tRange_Reads\tEnzyme_Reads\tPercent\n";
+print ST "$output\t$raw\t$cntN\t$cntQ\t$cnt_adapter\t$cnt_range\t$cnt_enzyme\t$ratio\n";
+
+sub CheckN{
+	my $line=shift;
+	my @tmp=split /\n/,$line;
+	my $length=length($tmp[1]);
+	@tmp=split //,$tmp[1];
+	my $count=0;
+	for my $base(@tmp){
+		if($base eq "N"){$count++;};
+	}
+	if($ncount>0 && $ncount<1){
+		if($ncount>= $count/$length){
+			return 1;
+		}else{
+			return 0;
+		}
+	}elsif($ncount==0 || $ncount>=1){
+		if($ncount>=$count){
+			return 1;
+		}else{
+			return 0;
+		}
+	}
+}
+sub CheckQ{
+	my $line = shift;
+	my @array = split /\n/,$line;
+	@array = split //,$array[3];
+	my $count = 0;
+	foreach my $i( @array ){
+		next unless( ord($i) >= $quality + $qbase );
+	    $count ++;
+	}
+	if( $count >= scalar(@array) * $percent / 100 ){
+		return 1;
+	}else{
+		return 0;
+	}
+}
+sub execute{
+    my $cmd = shift;
+    print "$cmd\n";
+    system($cmd);
+}
+sub CheckDir{
+    my $file = shift;
+    unless( -d $file ){
+        if( -d dirname($file) && -w dirname($file) ){system("mkdir $file");}
+        else{print STDERR "$file not exists and cannot be built\n";exit;}
+        }
+        return 1;
+}
+
+sub usage{
+	print STDERR "\e[32;1m
+	DESCRIPTION
+		data fractionation for LpnPI
+	USAGE
+		perl $0
+	PARAMETERS
+		-i       <s> input one or more raw_reads file
+		-norm    <s> norm reads count of data (eg:5M,5G)
+		-od      <s> outdir
+		-op      <s> outprefix
+		-s       <s> enzyme site 1-LpnPI
+		-seqplat <s> sequencing platform (Xten or SE50)
+	Options:
+		-pnorm   <s> over norm ratio [0.03]
+		-n       <s> the maximum ratio of base \"N\" [0.08]
+		-q       <s> minimum quality score to keep [30]
+		-p       <s> minimum percent of bases that must have [-q] quality [85]
+		-b       <s> quality values base [33]
+		-format  <s> format of output [fq] (fa or fq)
+		-adapter <s> type of adapter [2] (1:only right adapter;2:both left and right adapter)
+		VERSION 1.0 2019.01.04
+		AUTHOR Zhang Rongchao <zhangrongchaoxx\@163.com>\e[0m
+		\n";
+}
+
